@@ -269,7 +269,7 @@ function semente(){
   return {versao:1, locais, servidores:{}, removidos:[], config:{url:URL_PADRAO, chave:'', vistoriador:''}};
 }
 function carregar(){
-  try { const d = JSON.parse(localStorage.getItem(LS)); if (d && d.locais){ if (!d.config.url) d.config.url = URL_PADRAO; return d; } } catch(e){}
+  try { const d = JSON.parse(localStorage.getItem(LS)); if (d && d.locais){ if (!d.config.url) d.config.url = URL_PADRAO; if (d.locaisPend === undefined) d.locaisPend = Object.keys(d.servidores).length > 0; return d; } } catch(e){}
   return semente();
 }
 let db = carregar();
@@ -291,7 +291,7 @@ function colunasLocal(id){
   return m ? [m[1], m[2], setor, local] : [n1, '', setor, local];
 }
 const vistoriado = s => !!(s.vistoriado || Object.keys(s.riscos).length || Object.keys(s.epis).length);
-const pendentes = () => Object.values(db.servidores).filter(s => s.pendente).length + db.removidos.length;
+const pendentes = () => Object.values(db.servidores).filter(s => s.pendente).length + db.removidos.length + (db.locaisPend ? 1 : 0);
 function marcarPendentes(localId){ servidoresEm(localId).forEach(s => { s.pendente = true; }); }
 
 /* ===================== UI BÁSICA ===================== */
@@ -354,7 +354,8 @@ function viewRaiz(){
   <div class="resumo"><div><b>${tot}</b><span>servidores</span></div><div><b>${vist}</b><span>vistoriados</span></div><div><b>${pendentes()}</b><span>a sincronizar</span></div></div>
   <input type="text" id="busca" placeholder="🔎 Buscar servidor, função ou local…" style="margin-top:8px">
   <div id="resBusca"></div>
-  ${tot ? '' : '<div class="nota">Ainda não há servidores. Em Configurações › Restaurar backup, carregue o arquivo base gerado da sua planilha.</div>'}
+  ${db.config.chave ? '' : `<div class="card" style="margin-top:10px"><h3>Primeiro acesso neste aparelho</h3><p class="nota" style="margin:0 0 10px">Informe seu nome e a chave de acesso para carregar os dados da planilha.</p><input type="text" id="nomeRapido" placeholder="Seu nome" value="${esc(db.config.vistoriador)}" style="margin-bottom:8px"><div class="linha-add" style="margin:0"><input type="password" id="chaveRapida" placeholder="Chave de acesso"><button class="btn" data-act="entrar">Carregar</button></div></div>`}
+  ${db.ultimaAtualizacao ? `<div class="nota" style="background:none;padding:6px 4px 0">Última atualização da planilha: ${new Date(db.ultimaAtualizacao).toLocaleString('pt-BR',{dateStyle:'short',timeStyle:'short'})}</div>` : ''}
   <div class="sec-tit">Escolha a unidade / área</div>
   <div class="lista">${filhos(null).map(itemLocal).join('')}</div>
   <div class="acoes"><button class="btn sec" data-act="addLocal" data-pai="">+ Nova área</button></div>`;
@@ -468,7 +469,7 @@ function viewCfg(){
   <div class="card"><h3>Planilha Google (Apps Script)</h3>
     ${campo('URL do App da Web','cfg.url',c.url,'url','https://script.google.com/macros/s/…/exec')}
     ${campo('Chave de acesso','cfg.chave',c.chave,'password','A mesma definida no script')}
-    <div class="acoes"><button class="btn sec" data-act="testar">Testar conexão</button><button class="btn" data-act="sync">Sincronizar (${pendentes()})</button></div>
+    <div class="acoes"><button class="btn sec" data-act="testar">Testar conexão</button><button class="btn" data-act="sync">Sincronizar agora</button></div>
     <div class="acoes"><button class="btn sec" data-act="syncTudo">Reenviar tudo</button></div>
   </div>
   <div class="card"><h3>Exportar (CSV)</h3>
@@ -504,27 +505,57 @@ function linhasLocais(){
 }
 
 /* ===================== SINCRONIZAÇÃO ===================== */
-async function sincronizar(tudo){
+async function enviar(tudo){
   const c = db.config;
-  if (!c.url){ toast('Configure a URL da planilha primeiro'); location.hash = '#/cfg'; return; }
   const lista = Object.values(db.servidores).filter(s => tudo || s.pendente).filter(s => s.nome);
-  const rem = [...db.removidos];
-  if (!lista.length && !rem.length){ toast('Nada pendente para enviar'); return; }
-  if (!navigator.onLine){ toast('Sem internet — os dados continuam salvos no aparelho'); return; }
+  const rem = [...db.removidos], vaiLocais = !!db.locaisPend;
+  if (!lista.length && !rem.length && !vaiLocais) return 0;
   const marca = {}; lista.forEach(s => marca[s.id] = s.atualizado);
   const L = todasLinhas(lista);
   const payload = {chave:c.chave, acao:'sync', ids:lista.map(s => s.id), removidos:rem,
-    servidores:L.Servidores, riscos:L.Riscos, epis:L.EPIs, locais:linhasLocais()};
+    servidores:L.Servidores, riscos:L.Riscos, epis:L.EPIs,
+    brutos: lista.map(s => [s.id, JSON.stringify({...s, pendente:false, sincronizado:true}), s.atualizado])};
+  if (vaiLocais){ payload.locaisBrutos = Object.values(db.locais).map(l => [l.id, JSON.stringify(l)]); payload.locaisRemovidos = [...(db.locaisRem || [])]; }
+  const r = await fetch(c.url, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body:JSON.stringify(payload)});
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.erro || 'Erro no script');
+  lista.forEach(s => { const x = db.servidores[s.id]; if (x){ x.sincronizado = true; if (x.atualizado === marca[s.id]) x.pendente = false; } });
+  db.removidos = db.removidos.filter(x => !rem.includes(x));
+  if (vaiLocais){ db.locaisPend = false; db.locaisRem = []; }
+  salvarJa();
+  return lista.length + rem.length + (vaiLocais ? 1 : 0);
+}
+async function baixarPlanilha(){
+  const c = db.config;
+  const r = await fetch(c.url + (c.url.includes('?') ? '&' : '?') + 'acao=baixar&chave=' + encodeURIComponent(c.chave));
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.erro || 'Erro no script');
+  if (j.locais.length && !db.locaisPend){ const L = {}; j.locais.forEach(l => L[l.id] = l); db.locais = L; }
+  const remoto = {}; j.servidores.forEach(x => remoto[x.id] = x);
+  for (const id in remoto){
+    if (db.removidos.includes(id)) continue;
+    const loc = db.servidores[id];
+    if (!loc || !loc.pendente) db.servidores[id] = {...remoto[id], pendente:false, sincronizado:true};
+  }
+  for (const id in db.servidores){ const x = db.servidores[id]; if (!remoto[id] && x.sincronizado && !x.pendente) delete db.servidores[id]; }
+  db.ultimaAtualizacao = agora();
+  salvarJa();
+  return j.servidores.length;
+}
+let ocupado = false;
+async function sincronizar(tudo, silencioso){
+  const c = db.config;
+  if (!c.url || !c.chave){ if (!silencioso){ toast('Digite a chave de acesso primeiro'); location.hash = '#/cfg'; } return; }
+  if (!navigator.onLine){ if (!silencioso) toast('Sem internet — os dados continuam salvos no aparelho'); return; }
+  if (ocupado) return; ocupado = true;
   const btn = document.getElementById('btnSync'); btn.style.opacity = .5;
   try{
-    const r = await fetch(c.url, {method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body:JSON.stringify(payload)});
-    const j = await r.json();
-    if (!j.ok) throw new Error(j.erro || 'Erro no script');
-    lista.forEach(s => { const x = db.servidores[s.id]; if (x){ x.sincronizado = true; if (x.atualizado === marca[s.id]) x.pendente = false; } });
-    db.removidos = db.removidos.filter(x => !rem.includes(x));
-    salvarJa(); toast(`Enviado: ${lista.length} servidor(es) ✓`); render();
-  }catch(e){ toast('Falha ao enviar: ' + e.message); }
-  finally{ btn.style.opacity = 1; }
+    const env = await enviar(tudo);
+    const n = await baixarPlanilha();
+    if (!silencioso || env) toast(env ? `Enviado ✓ · planilha com ${n} servidores` : `Atualizado da planilha ✓ (${n} servidores)`);
+    if (!location.hash.startsWith('#/s/')) render(); else badge();
+  }catch(e){ if (!silencioso) toast('Falha: ' + e.message); }
+  finally{ btn.style.opacity = 1; ocupado = false; }
 }
 
 /* ===================== ARQUIVOS ===================== */
@@ -542,14 +573,14 @@ document.getElementById('arqImport').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
   try{ const d = JSON.parse(await f.text()); if (!d.locais || !d.servidores) throw 0;
     const r = await modal('Restaurar backup?', `<p>Isso substitui todos os dados deste aparelho pelos do arquivo (${Object.keys(d.servidores).length} servidores).</p>`, [{t:'Cancelar',v:'cancelar',cls:'sec'},{t:'Restaurar',v:'ok'}]);
-    if (r.acao === 'ok'){ const cfg = db.config; db = d; db.config = {...d.config, url: d.config.url || cfg.url || URL_PADRAO, chave: d.config.chave || cfg.chave}; salvarJa(); toast('Backup restaurado'); location.hash = '#/'; render(); }
+    if (r.acao === 'ok'){ const cfg = db.config; db = d; db.config = {...d.config, url: d.config.url || cfg.url || URL_PADRAO, chave: d.config.chave || cfg.chave}; db.locaisPend = true; salvarJa(); toast('Backup restaurado'); location.hash = '#/'; render(); }
   }catch(_){ toast('Arquivo inválido'); }
   e.target.value = '';
 };
 
 /* ===================== EVENTOS ===================== */
 function setPath(obj, path, v){ const p = path.split('.'); let o = obj; while (p.length > 1){ const k = p.shift(); o[k] = o[k] || {}; o = o[k]; } o[p[0]] = v; }
-function tocar(s){ s.atualizado = agora(); s.pendente = true; if (!s.data) s.data = hoje(); if (!s.vistoriador) s.vistoriador = db.config.vistoriador; salvar(); }
+function tocar(s){ s.atualizado = agora(); s.pendente = true; if (!s.data) s.data = hoje(); if (db.config.vistoriador) s.vistoriador = db.config.vistoriador; salvar(); }
 
 function onCampo(e){
   const el = e.target;
@@ -601,6 +632,7 @@ app.addEventListener('toggle', e => {
 app.addEventListener('keydown', e => {
   if (e.key !== 'Enter' || e.target.tagName !== 'INPUT') return;
   if (e.target.dataset.novoag){ e.preventDefault(); app.querySelector(`[data-act=addAg][data-g=${e.target.dataset.novoag}]`).click(); }
+  if (e.target.id === 'chaveRapida'){ e.preventDefault(); app.querySelector('[data-act=entrar]').click(); }
   if (e.target.id === 'novoEpi'){ e.preventDefault(); app.querySelector('[data-act=addEpi]').click(); }
 });
 
@@ -614,7 +646,7 @@ app.addEventListener('click', async e => {
     const r = await modal(nivel===1 ? 'Nova unidade / área' : nivel===2 ? 'Novo setor' : 'Novo local de trabalho',
       `<input type="text" name="nome" placeholder="Nome">`, [{t:'Cancelar',v:'cancelar',cls:'sec'},{t:'Adicionar',v:'ok'}]);
     const nome = (r.vals.nome || '').trim();
-    if (r.acao === 'ok' && nome){ const id = uid(); db.locais[id] = {id, nome, pai, nivel, ordem: nivel===1 ? 99 : undefined}; salvarJa(); render(); toast('Adicionado'); }
+    if (r.acao === 'ok' && nome){ const id = uid(); db.locais[id] = {id, nome, pai, nivel, ordem: nivel===1 ? 99 : undefined}; db.locaisPend = true; salvarJa(); render(); toast('Adicionado'); }
   }
   else if (act === 'addVarios'){
     const pai = b.dataset.pai, nivel = db.locais[pai].nivel + 1;
@@ -626,16 +658,16 @@ app.addEventListener('click', async e => {
     (r.vals.lista || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean).forEach(nome => {
       if (exist.has(nome.toLowerCase())) return; exist.add(nome.toLowerCase());
       const id = uid(); db.locais[id] = {id, nome, pai, nivel}; n++; });
-    salvarJa(); render(); toast(`${n} local(is) adicionado(s)`);
+    db.locaisPend = true; salvarJa(); render(); toast(`${n} local(is) adicionado(s)`);
   }
   else if (act === 'editLocal'){
     const l = db.locais[b.dataset.id], qtd = servidoresEm(l.id).length;
     const r = await modal('Editar local', `<input type="text" name="nome" value="${esc(l.nome)}">${qtd ? `<p style="margin-top:10px">${qtd} servidor(es) vinculado(s) — para excluir, mova ou exclua-os antes.</p>` : ''}`,
       [...(qtd ? [] : [{t:'Excluir',v:'del',cls:'perigo'}]), {t:'Cancelar',v:'cancelar',cls:'sec'}, {t:'Salvar',v:'ok'}]);
-    if (r.acao === 'ok' && r.vals.nome.trim() && r.vals.nome.trim() !== l.nome){ l.nome = r.vals.nome.trim(); marcarPendentes(l.id); salvarJa(); render(); toast('Nome corrigido'); }
+    if (r.acao === 'ok' && r.vals.nome.trim() && r.vals.nome.trim() !== l.nome){ l.nome = r.vals.nome.trim(); marcarPendentes(l.id); db.locaisPend = true; salvarJa(); render(); toast('Nome corrigido'); }
     if (r.acao === 'del'){
       const c = await modal('Excluir local?', `<p>“${esc(l.nome)}” e todos os seus sublocais serão removidos.</p>`, [{t:'Cancelar',v:'cancelar',cls:'sec'},{t:'Excluir',v:'ok',cls:'perigo'}]);
-      if (c.acao === 'ok'){ subarvore(l.id).forEach(i => delete db.locais[i]); salvarJa(); render(); toast('Local excluído'); }
+      if (c.acao === 'ok'){ db.locaisRem = db.locaisRem || []; subarvore(l.id).forEach(i => { delete db.locais[i]; db.locaisRem.push(i); }); db.locaisPend = true; salvarJa(); render(); toast('Local excluído'); }
     }
   }
   else if (act === 'novoServ'){
@@ -664,6 +696,13 @@ app.addEventListener('click', async e => {
     const id = 'x' + uid(); s.epiExtra = s.epiExtra || {}; s.epiExtra[id] = {n:nome}; s.epis[id] = {tam:'', sit:'Fornecer'};
     tocar(s); document.getElementById('epis').innerHTML = htmlEpis(s);
   }
+  else if (act === 'entrar'){
+    const k = document.getElementById('chaveRapida').value.trim(), nm = document.getElementById('nomeRapido').value.trim();
+    if (!nm){ toast('Informe seu nome'); return; } if (!k) return;
+    db.config.chave = k; db.config.vistoriador = nm; salvarJa(); toast('Carregando dados…');
+    try{ await baixarPlanilha(); toast('Dados carregados ✓'); render(); }
+    catch(err){ db.config.chave = ''; salvarJa(); toast('Não carregou: ' + err.message); render(); }
+  }
   else if (act === 'marcaVist' && s){ s.vistoriado = !s.vistoriado; tocar(s); salvarJa(); render(); toast(s.vistoriado ? 'Marcado como vistoriado' : 'Desmarcado'); }
   else if (act === 'toggleTodos' && s){ mostrarTodos = !mostrarTodos; document.getElementById('epis').innerHTML = htmlEpis(s); }
   else if (act === 'testar'){
@@ -683,8 +722,11 @@ app.addEventListener('click', async e => {
   }
 });
 window.addEventListener('pagehide', salvarJa);
+window.addEventListener('online', () => sincronizar(false, true));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) sincronizar(false, true); });
 document.addEventListener('visibilitychange', () => { if (document.hidden) salvarJa(); });
 render();
+sincronizar(false, true);
 </script>
 </body>
 </html>
